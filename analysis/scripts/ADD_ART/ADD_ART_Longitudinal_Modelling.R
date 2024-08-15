@@ -88,6 +88,11 @@ dat_censored <- dat %>%
     )
   ))
 
+dat_eam = read.csv("ADDART_long_eam_14May2024.csv")
+dat_eam$wp_days = dat_eam$n_intakes + dat_eam$n_heartbeats
+dat_eam$log_wp_days = log(dat_eam$wp_days+1)
+offset = dat_eam$log_wp_days
+
 
 #--------------------- beta GLMM w/ censored data -----------------------
 #this is not an appropriate way distribution to model this data with, 
@@ -178,27 +183,27 @@ compare_modelfits(list(fit_betabin_1a = fit_betabin_1a,
 ##---------- determine fixed effects
 # functional form of time considered up to cubic
 fit_1_null = glmmTMB(
-  formula = n_heartbeats ~ 1 + offset(log_wp_days) + (1|PID),
+  formula = n_heartbeats ~ 1 + offset(offset) ,
   family = poisson(link = "log"),
-  data = dat_censored
+  data = dat_eam
 )
 summary(fit_1_null)
 
 fit_1a = glmmTMB(
-  formula = n_heartbeats ~ Visit + offset(log_wp_days) + (1|PID),
+  formula = n_heartbeats ~ Visit + offset(log_wp_days) + (1|id),
   family = poisson(link = "log"),
-  data = dat_censored
+  data = dat_eam
 )
 summary(fit_1a)
 resids(fit_1a)
 
 fit_1b = update(fit_1a, 
-                formula = n_heartbeats ~ Visit + I(Visit^2) + offset(log_wp_days) + (1|PID))
+                formula = n_heartbeats ~ Visit + I(Visit^2) + offset(log_wp_days) + (1|id))
 summary(fit_1b)
 resids(fit_1b)
 
 fit_1c = update(fit_1b,
-                formula = n_heartbeats ~ Visit + I(Visit^2) + I(Visit^3) + offset(log_wp_days) + (1|PID))
+                formula = n_heartbeats ~ Visit + I(Visit^2) + I(Visit^3) + offset(log_wp_days) + (1|id))
 summary(fit_1c)
 
 models <- list(fit_1_null = fit_1_null, fit_1a = fit_1a, fit_1b = fit_1b, fit_1c = fit_1c)
@@ -240,7 +245,7 @@ compare_modelfits(list(
 
 #--------- try best model with random slope
 fit_1e_iii = update(fit_1e_ii,
-                    formula = n_heartbeats ~ Visit + I(Visit^2) + I(Visit^3)  + offset(log_wp_days) + (Visit|PID),
+                    formula = n_heartbeats ~ Visit + I(Visit^2) + I(Visit^3)  + offset(log_wp_days) + (Visit|id),
                     ziformula = ~ 1,
                     dispformula = ~ Visit)
 
@@ -276,9 +281,9 @@ compare_modelfits(models)
 summary(fit_1e_iii)
 fit_1e_iii_adapt = mixed_model(
   fixed = n_heartbeats ~ Visit + I(Visit^2) + I(Visit^3) + offset(log_wp_days),
-  random = ~ Visit | PID,
+  random = ~ Visit | id,
   family = "poisson",
-  data = dat_censored
+  data = dat_eam
   
 )
 

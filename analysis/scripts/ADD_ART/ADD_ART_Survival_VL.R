@@ -1,293 +1,325 @@
 #ADD-ART Survival Modelling
 # 02 April 2024
+
 rm(list=ls())
-
-
-#load dependencies
+# Load libraries
 library(tidyverse)
+library(ggplot2)
+library(ggpubr)
+library(GGally)
 library(survival)
 library(survminer)
-library(KMsurv)
 library(ldatools)
 
 
-path_in = "~/Downloads/MSc/Dissertation/data_management/output/ADD_ART"
-path_out = "~/Downloads/MSc/Dissertation/analysis/output/ADD_ART"
+path_data = "~/Downloads/MSc/Dissertation/data_management/output/ADD_ART"
+path_out = "~/Downloads/MSc/Dissertation/analysis/output/ADD_ART/figures"
+
+# Load data
+setwd(path_data)
+
+dat_recurrent = read.csv("ADDART_recurrent_14May2024.csv")
+
+dat_long_eam = read.csv("ADDART_long_eam_14May2024.csv")
+
+dat_long_tfv = read.csv("ADDART_long_tfv_14May2024.csv")
+
+dat_long_joint = read.csv("ADDART_long_joint_14May2024.csv")
+
+#------------------- data wrangling -------------------
+dat_long_eam$Visit = as.factor(dat_long_eam$Visit)
+dat_long_eam$`log2(VL+0.001)` = log2(dat_long_eam$VL + 0.001)
+
+dat_long_eam = dat_long_eam %>%
+  mutate(wp_nonadherence_prop_30day = n_heartbeats_30days/wp_days_30,
+         sra_nonadherence_prop = 1 - sra1_adherence_prop)
+
+###--------------data wrangling ----------------
+
+# time to first viral load > 1000
+dat_long_eam$Visit = as.numeric(dat_long_eam$Visit)
+dat_long_eam$VBstatus = ifelse(dat_long_eam$VL > 1000, 1, 0)
+
+Surv = with(dat_long_eam, Surv(time = Visit, event = VBstatus))
+km_fit1a = survfit(Surv ~ 1, dat = dat_long_eam)
+ggsurvplot(km_fit1a, dat = dat_long_eam, conf.type = "log-log")
 
 
+#time to first non-suppression event
+dat_long_eam$VL_supp_status = ifelse(dat_long_eam$VL > 50, 1, 0)
+Surv2 = with(dat_long_eam, Surv(time = time_yrs, event = VL_supp_status))
+km_fit2a = survfit(Surv2 ~ 1, data = dat_long_eam)
+ggsurvplot(km_fit2a, data = dat_long_eam,
+           risk.table = T,
+           cumevents = T,
+           conf.type = "log-log")
 
-#---- load data
-setwd(path_in)
-dat = read.csv("ADDART_visitwise_07March2024.csv",
-               row.names = 1)
-
-#----------- data wrangling ----------
-##------ model agnostic data wrangling ------
-dat$AGE_centered = scale(dat$AGE, scale = F, center = T) #demean age for interpretable intercepts
-#number of days between arv initiation and visit 1
-dat$days_since_initiation = as.numeric(difftime(dat$BLdate, dat$arv_initiation_date, units = "days"))
-dat$days_since_initiation_centered = scale(dat$days_since_initiation, scale = F, center = T) 
-
-#calculate number of days between baseline visit each subsequent visit
-dat = dat %>% group_by(PID) %>%
-  mutate(days_since_visit_0 = as.numeric(difftime(VISITdate, VISITdate[1], units = "days"))) %>%
-  relocate(days_since_visit_0, .after = Visit)
-
-
-##---------------- time to first viral non-suppression --------------
-#create survival indicator for first viral non-suppression: ignore subsequent events
-dat = dat %>%
-  mutate(VL_ns = ifelse(VL >= 50, 1, 0)) %>%
-  relocate(VL_ns, .after = VL)
-
-#find time to first VL_ns event for each PID
-first_VS = dat %>% filter(VL_ns == TRUE) %>%
-  group_by(PID) %>% slice(1) %>% ungroup() 
-
-#if PID not in above, then they are censored and last attended visit is used
-last_VS = dat %>% group_by(PID) %>% filter(missed_visit == 0) %>%
-  slice(n()) %>% ungroup() %>% filter(!PID %in% first_VS$PID)
-#combine first and last
-dat_singleevent = bind_rows(first_VS, last_VS) %>% arrange(PID)
-
-surv_VS1st = Surv(time = dat_singleevent$days_since_visit_0, event = dat_singleevent$VL_ns)
-
-
-
-#create survival object for lost to care: 3 consecutive missed visits
-#find when PID has 3 consecutive missed visits == 1
-dat$lost_to_care = 0
-dat = dat %>% group_by(PID) %>%
-  mutate(lost_to_care = ifelse(zoo::rollapply(missed_visit, 3, sum, fill = NA, align = "right", partial = TRUE) == 3, 1, 0)) %>%
-  relocate(lost_to_care, .after = missed_visit)
-
-surv_LTC = Surv(time = dat$days_since_visit_0, event = dat$lost_to_care)
-head(cbind(dat$PID, dat$Visit, dat$missed_visit, dat$lost_to_care, surv_LTC), 20)
-
-
-
-##----- recurrent events data wrangling ------
-#get data in counting process format
-#counting process format: PID is represented by rows as study entry, event 1 time, event 2 time, event m time, final follow-up
-#remove all missing viral load events
-dat = dat %>%
-  filter(!is.na(VL))
-
-all_VS = dat %>% filter(missed_visit == 0) %>% #all observations at visit 12 follow up or with VL_ns event
-  filter(VL_ns == TRUE | Visit == 12) 
-last_VS = dat %>% group_by(PID) %>% #all observations at final follow up when it is not visit 12
-  filter(missed_visit == 0) %>% 
-  slice(n()) %>% filter(Visit != 12) %>% ungroup()
-
-#create interval times
-all_VS = all_VS %>% group_by(PID) %>%
-  mutate(start = lag(days_since_visit_0, n = 1, default = 0)) %>%
-  relocate(start, .after = Visit)
-
-last_VS = last_VS %>% mutate(start = 0) %>%
-  relocate(start, .after = Visit)
-
-#merge
-dat_recurrent = bind_rows(all_VS, last_VS) %>%
-  arrange(PID, Visit) %>%
-  relocate(VL_ns, .after = days_since_visit_0)
-
-#remove baseline
-dat_recurrent = dat_recurrent %>% filter(Visit > 0)
-
-
-
-
-#finally create enum variable: cumulative number of events for each PID
+#recurrent
+#create visit time start for interest
 dat_recurrent = dat_recurrent %>%
   group_by(PID) %>%
-  mutate(event_number = cumsum(VL_ns)) %>%
-  relocate(event_number, .after = VL_ns)
+  mutate(visit_start = lag(Visit, 1, default = 0)) %>%
+  relocate(visit_start, .before = Visit)
 
-Surv_cp = Surv(time = dat_recurrent$start, 
-               time2 = dat_recurrent$days_since_visit_0,
-               dat_recurrent$VL_ns, 
-               type = "counting")
-ggsurvplot(survfit(Surv_cp ~ 1), data = dat_recurrent)
+#create log10TFV
+dat_recurrent$log10_TFV = log10(dat_recurrent$TFV)
+###---------------- supporting stats ---------------
+n_events_per_id = dat_long_eam  %>% group_by(id) %>% summarise(n_events = sum(VL>50))
+print(n_events_per_id, n=1000)
+mean(n_events_per_id$n_events, na.rm = TRUE)
+n_events_per_id %>% filter(n_events >= 1 & !is.na(n_events)) %>%
+  summarise(mean = mean(n_events))
+
+#create quantile variables for numerical covariates
+colnames(dat_recurrent)
+dat_recurrent %>% 
+  filter(PID %in% unique(PID)) %>%
+  summarise(median_TFV_baseline = quantile(TFV_baseline, na.rm = TRUE),
+            median_vsra1_baseline = quantile((1-sra_1_baseline)*30,  na.rm = T),
+            median_VL_baseline = quantile((VL_baseline), na.rm = TRUE))
+
+dat_recurrent = dat_recurrent %>%
+  ungroup() %>%
+  mutate(poor_adherence_TFV_baseline = ifelse(TFV_baseline < 1060.4, 1, 0),
+         poor_adherence_SR_baseline = ifelse((1-sra_1_baseline)*30 > 2, 1, 0),
+         unsuppressed_VL_baseline = ifelse(VL_baseline > 49, 1, 0))
+
+#aggregate adherence data for each individual
+dat_recurrent_adherence = dat_recurrent %>%
+  group_by(PID) %>%
+  summarise(mean_n_heartbeats_30days = mean(n_heartbeats_30days, na.rm = TRUE),
+            mean_vsra1 = mean(Vsra1_days_nonadherent, na.rm = TRUE),
+            mean_TFV = mean(TFV, na.rm = TRUE))
+dat_recurrent_adherence
+
+#join 
+dat_recurrent = dat_recurrent_adherence %>%
+  left_join(dat_recurrent,
+            by = "PID")
+
+# global means 
+tmp = dat_recurrent %>%
+  summarise(mean(mean_vsra1, na.rm = TRUE),
+            mean(mean_TFV, na.rm = TRUE),
+            mean(mean_n_heartbeats_30days, na.rm = TRUE))
+
+dat_recurrent = dat_recurrent %>%
+  mutate(poor_adherence_SR = ifelse(mean_vsra1 > mean(mean_vsra1, na.rm = TRUE), 1, 0),
+         poor_adherence_TFV = ifelse(mean_TFV < mean(mean_TFV, na.rm = TRUE), 1, 0),
+         poor_adherence_eam = ifelse(mean_n_heartbeats_30days > mean(mean_n_heartbeats_30days, na.rm = TRUE), 1, 0))
+
+dat_recurrent = dat_recurrent %>%
+  mutate(BMI_cat = case_when(
+    BMIcat == "< 18.5" ~ "< 25",
+    BMIcat == "18.5-24.9" ~ "< 25",
+    BMIcat == "25-29.9" ~ "25 - 29.9",
+    BMIcat == "30 or +" ~ "> 30"
+  ))
+
+
+#time from visit 0
+Surv3b = with(dat_recurrent, 
+              Surv(time = start, time2 = time_yrs,
+                   event = VL> 50, type = "counting"))
+
 
 
 
 #--------------------------------- analysis ---------------------------------
-#---------------- EDA ---------------
-##--- Viral nonsuppression ---
-km_fit = survfit(surv_VS1st ~ 1, data = dat_singleevent)
-ggsurvplot(km_fit,
-           data=dat)
-
-
-
-
-
-
-#----------------- Cox PH Model:  ---------------
-##---- Time to first Viral nonsuppression event -------
-VSfit_null = coxph(surv_VS1st ~ 1, 
-                   data = dat_singleevent)
-summary(VSfit_null)
-
-VSfit_null_2 = coxph(Surv(days_since_visit_0, VL_ns) ~ 1,
-                     data = dat, id=PID)
-summary(VSfit_null_2)
-#----- demographic covariates
-VSfit_1a = update(VSfit_null,
-                  . ~ . + AGE_centered)
-VSfit_1b = update(VSfit_1a,
-                  . ~ . + I(AGE_centered^2))
-anova(VSfit_null, VSfit_1a, VSfit_1b) #no age terms are close to significant
-summary(VSfit_1a)
-
-VSfit_1c = coxph(surv_VS1st ~ GENDER, data = dat_singleevent)
-anova(VSfit_null, VSfit_1c) #gender is borderline significant
-summary(VSfit_1c)
-
-VSfit_1d = coxph(surv_VS1st ~ GENDER * AGE_centered, data = dat_singleevent)
-summary(VSfit_1d) #interaction is not significant but improves gender effect
-anova(VSfit_1c, VSfit_1d)
-
-
-
-#----- medical history covariates: baseline VL, TB diagnosis, anemia, HIV illness
-VSfit_1e = update(VSfit_1d,
-                  . ~ . +  VL_baseline)
-summary(VSfit_1e) #baseline VL is significant
-
-VS_fit_1f = update(VSfit_1e,
-                   . ~ . +  Vmed9_everhadTB)
-summary(VS_fit_1f) #TB diagnosis is significant
-
-VS_fit_1g = update(VS_fit_1f,
-                   . ~ . + Vmed9_everhadTB:VL_baseline)
-summary(VS_fit_1g) #interaction is not significant
-anova(VS_fit_1f, VS_fit_1g)
-
-VS_fit_1h = update(VS_fit_1f,
-                   .~. + Vmed10_anemia_ever)
-summary(VS_fit_1h)
-
-VS_fit_1i = update(VS_fit_1f,
-                   .~. + Vmed7_HIVillness_ever)
-summary(VS_fit_1i)
-
-VS_fit_j = update(VS_fit_1f,
-                  .~. + days_since_initiation_centered)
-summary(VS_fit_j)
-
-#----- clinical covariates: baseline hematocrit, BMI
-VS_fit_1k = update(VS_fit_1f,
-                  . ~ . + HCT_baseline)
-summary(VS_fit_1k)
-
-VS_fit_1l = update(VS_fit_1f,
-                  . ~ . + bmi_1st)
-summary(VS_fit_1l)
-
-#----- reintroduce covariates that are included in literature (Jennings et al 2022)
-# baseline HCT, BMI, age, gender
-# excluding BMI because many missings
-VS_fit_1m = update(VS_fit_1f,
-                   . ~ . + HCT_baseline + AGE_centered * GENDER)
-summary(VS_fit_1m)
-
-
 #----------------------------- RECURRENT EVENTS -----------------------------
-##----------------- Cox PH Model w unordered failure times ---------------
-#fit above model with robust se
-VS_fit_robust = coxph(surv_VS1st ~ VL_baseline + Vmed9_everhadTB + HCT_baseline + AGE_centered * GENDER,
-                       cluster = PID,
-                       data= dat_singleevent)
-summary(VS_fit_robust)
-
-#frailty model: random effect for PID
-VS_fit_frailty_1 = coxph(surv_VS1st ~ VL_baseline + Vmed9_everhadTB + HCT_baseline + AGE_centered + GENDER + frailty(PID, dist="gamma"),
-                         data = dat_singleevent)
-summary(VS_fit_frailty_1) #this has convergence error
-
-VS_fit_frailty_2 = coxph(surv_VS1st ~ VL_baseline + Vmed9_everhadTB + HCT_baseline + AGE_centered + GENDER + frailty(PID, dist="gauss"),
-                         data = dat_singleevent)
-summary(VS_fit_frailty_2) #convergence issues
+# forward selection procedure informed by theory and EDA
 
 
-###------------------- Anderson-Gill Model ---------------
-fit_ag1 = coxph(Surv(start, days_since_visit_0, VL_ns) ~ VL_baseline + Vmed9_everhadTB + HCT_baseline + AGE_centered*GENDER +
-                  cluster(PID), data = dat_recurrent)
-summary(fit_ag1)
 
-fit_ag2 = coxph(Surv(start, days_since_visit_0, VL_ns) ~ VL_baseline + Vmed9_everhadTB + HCT_baseline + AGE_centered + GENDER +
-                  cluster(PID), data = dat_recurrent)
-summary(fit_ag2)
+##------------------- MARGINAL MODELS (Anderson-Gill) ---------------
 
-fit_ag3 = coxph(Surv(start, days_since_visit_0, VL_ns) ~ VL_baseline + Vmed9_everhadTB + HCT_baseline +
-                  cluster(PID), data = dat_recurrent)
-summary(fit_ag3)
+fit_ag0 = coxph(Surv3b ~ 1,
+                cluster = PID,
+                data = dat_recurrent) 
+summary(fit_ag0)
 
-fit_ag4 = coxph(Surv(start, days_since_visit_0, VL_ns) ~ log(VL_baseline+1) + Vmed9_everhadTB +
-                  cluster(PID), data = dat_recurrent)
-summary(fit_ag4) #magnitude of significant coefficients barely change when excluding other covariates
+###----------------summarised adherence models ----------------
+#---- self report
+fit_ag_sr1 = update(fit_ag0,
+                   .~. + mean_vsra1)
+summary(fit_ag_sr1)
+#---- eam
+fit_ag_eam1 = update(fit_ag0,
+                   .~. + mean_n_heartbeats_30days)
+summary(fit_ag_eam1)
+
+#---- TFV
+fit_ag_tfv1 = update(fit_ag0,
+                   .~. + mean_TFV)
+summary(fit_ag_tfv1)
+
+#---- log10TFV
+fit_ag_tfv1 = update(fit_ag0,
+                   .~. + log10(mean_TFV))
+summary(fit_ag_tfv1) #log10 TFV is more meaningful given the sensitivity of the response over the large range
+#confint
+exp(-1*coefficients(fit_ag_tfv1) + c(-1,1) * 1.96*sqrt(vcov(fit_ag_tfv1)[1,1]))
+
+###----------------time-varying adherence models ----------------
+fit_ag_sr1a = update(fit_ag0,
+                     .~. + Vsra1_days_nonadherent)
+summary(fit_ag_sr1a)
+
+fit_ag_eam1a = update(fit_ag0,
+                     .~. + n_heartbeats_30days)
+summary(fit_ag_eam1a)
+
+
+fit_ag_tfv1a = update(fit_ag0,
+                     .~. + log10_TFV)
+summary(fit_ag_tfv1a)
+#confint
+exp(-1*coefficients(fit_ag_tfv1a) + c(-1,1) * 1.96*sqrt(vcov(fit_ag_tfv1a)[1,1]))
+
+
+
+#----------- adjusted models ----------------
+#---- self report
+fit_ag_sr2 = update(fit_ag_sr1a,
+                   .~. + BMI_cat)
+summary(fit_ag_sr2)
+
+fit_ag_sr3 = update(fit_ag_sr1a,
+                 .~. + Vmed5_rate_health)
+summary(fit_ag_sr3)
+
+fit_ag_sr4 = update(fit_ag_sr1a,
+                 .~. + Vmed9_everhadTB)
+summary(fit_ag_sr4)
+
+fit_ag_sr5 = update(fit_ag_sr4,
+                 .~. + sqrt(VL_baseline))
+summary(fit_ag_sr5)
+
+#----- eam
+fit_ag_eam2 = update(fit_ag_eam1a,
+                   .~. + BMI_cat)
+summary(fit_ag_eam2)
+
+fit_ag_eam3 = update(fit_ag_eam1a,
+                 .~. + Vmed5_rate_health)
+summary(fit_ag_eam3)
+
+fit_ag_eam4 = update(fit_ag_eam1a,
+                 .~. + Vmed9_everhadTB)
+summary(fit_ag_eam4)
+
+fit_ag_eam5 = update(fit_ag_eam4,
+                 .~. + sqrt(VL_baseline))
+summary(fit_ag_eam5)
+
+
+#----- TFV
+fit_ag_tfv2 = update(fit_ag_tfv1a,
+                   .~. + BMI_cat)
+summary(fit_ag_tfv2)
+
+fit_ag_tfv3 = update(fit_ag_tfv1a,
+                 .~. + Vmed5_rate_health)
+summary(fit_ag_tfv3)
+
+fit_ag_tfv4 = update(fit_ag_tfv1a,
+                 .~. + Vmed9_everhadTB)
+summary(fit_ag_tfv4)
+
+fit_ag_tfv5 = update(fit_ag_tfv4,
+                 .~. + sqrt(VL_baseline))
+summary(fit_ag_tfv5)
+#confint
+exp(-1*coefficients(fit_ag_tfv5) -  (sqrt(diag(vcov(fit_ag_tfv5)))*1.96))
+exp(-1*coefficients(fit_ag_tfv5) +  (sqrt(diag(vcov(fit_ag_tfv5)))*1.96))
+
+
+
+#------------fit final models but frailties instead of marginal
+fit_sr5_frail = coxph(Surv3b ~ Vsra1_days_nonadherent + Vmed9_everhadTB + sqrt(VL_baseline) + frailty(PID),
+                      data = dat_recurrent)
+fit_eam5_frail = coxph(Surv(start, time_yrs, VL > 50) ~ n_heartbeats_30days + Vmed9_everhadTB + sqrt(VL_baseline) +  frailty(PID),
+                      data = dat_recurrent)
+fit_tfv5_frail = coxph(Surv3b ~ log10_TFV + Vmed9_everhadTB + sqrt(VL_baseline) +  frailty(PID),
+                      data = dat_recurrent)
+summary(fit_sr5_frail)
+summary(fit_eam5_frail)
+summary(fit_tfv5_frail)
 
 
 #----------------- DIAGNOSTICS --------------------------------------
-##----------------- naive model -------------
-#check proportional hazards assumption
-cox.zph(VS_fit_1m)
-plot(cox.zph(VS_fit_1m)) #lookin good, good lookin
-
-#check overall fit
-gg_coxsnell(VS_fit_1m, type="cumu") +
-  geom_abline(intercept=0, slope=1, col=2)
-
-#check model specification
-plot(lowess(residuals(VS_fit_1m, type="martingale")~tmp$VL_baseline), type="l",
-     xlab="age.centered", ylab="Martingale residuals")
-
-#check outliers
-ggcoxdiagnostics(VS_fit_1m, type="deviance") 
-
-#check for influentials
-ggcoxdiagnostics(VS_fit_1m, type="score", ox.scale = "time")
-
-##----------------- robust model -------------
-cox.zph(VS_fit_robust)
-plot(cox.zph(VS_fit_robust)) #not lookin good
-
-gg_coxsnell(VS_fit_robust, type="cumu") +
-  geom_abline(intercept=0, slope=1, col=2)
-
-plot(lowess(residuals(VS_fit_robust, type="martingale")~dat$VL_baseline), type="l",
-     xlab="age.centered", ylab="Martingale residuals")
-
-ggcoxdiagnostics(VS_fit_robust, type="deviance")
-
-ggcoxdiagnostics(VS_fit_robust, type="score", ox.scale = "time")
-
+model = fit_ag_tfv5
+adher = dat_recurrent$n_heartbeats_30days
+adhername = "EAM"
 ##----------------- AG model -------------
 #check proportional hazards assumption
-cox.zph(fit_ag4)
-plot(cox.zph(fit_ag4)) #lookin good, good lookin
+cox.zph(model)
+par(mfrow=c(3,1))
+plot(cox.zph(model), hr=F)
 
 #check overall fit
-gg_coxsnell(fit_ag4, type="cumu") +
+gg_coxsnell(model, type="cumu") +
   geom_abline(intercept=0, slope=1, col=2) #overall fit a bit suss
 
 #check model specification
-mg1 = residuals(coxph(Surv(start, days_since_visit_0, VL_ns) ~ VL_baseline, data = dat_recurrent), type="martingale")
-mg2 = residuals(coxph(Surv(start, days_since_visit_0, VL_ns) ~ Vmed9_everhadTB, data = dat_recurrent), type="martingale")
+mg1 = residuals(coxph(Surv3b ~ Vmed9_everhadTB + sqrt(VL_baseline), #excludes adherence
+                      data = dat_recurrent), type="deviance")
+mg2 = residuals(coxph(Surv3b ~ adher + Vmed9_everhadTB, #excludes VL_baseline
+                      data = dat_recurrent), type="deviance")
 
-plot(mg1~dat_recurrent$Vmed9_everhadTB, type="p")
+plot(mg1~adher , type="p",
+     xlab = adhername,
+     ylab = "Deviance residuals") 
 
-plot(mg2~log(dat_recurrent$VL_baseline[which(!is.na(dat_recurrent$Vmed9_everhadTB))]+1), type="p"
-     )
+
+plot(mg2~dat_recurrent$VL_baseline, type="p")
+plot(mg2~sqrt(dat_recurrent$VL_baseline), type="p",
+     xlab = "sqrt(VL_baseline)",
+     ylab = "Deviance residuals")
+
+
+
 #check outliers
-ggcoxdiagnostics(fit_ag4, type="deviance")  
+ggcoxdiagnostics(model, type="deviance")     #strange p[atterns in these resids, a strip at resids = 1
+
+ggcoxdiagnostics(model, type="dfbeta") #check for influentials
+
 
 #check for influentials
-ggcoxdiagnostics(fit_ag4, type="score", ox.scale = "time")
+ggcoxdiagnostics(model, type="score", ox.scale = "time")
+
+#further investigate influential obs
+model = fit_ag_tfv5
+ggcoxdiagnostics(model, type="score", ox.scale = "time")
+thresh = 2000
+colnames(residuals(model, "score"))
+indices = which(abs(residuals(model, "score"))[,1] > thresh)
+dat_recurrent[indices,] %>%
+  select(PID, Visit, time_yrs, VL,
+         Vsra1_days_nonadherent, n_heartbeats_30days, n_intakes_30days,
+         Vmed9_everhadTB, VL_baseline, TFV) %>% View()
 
 
+
+#investigate the concentration of resids at -1
+model_frail = coxph(Surv3b ~ TFV + sqrt(VL_baseline) + Vmed9_everhadTB + frailty(PID), data=dat_recurrent)
+model_clust = coxph(Surv3b ~ TFV + sqrt(VL_baseline) + Vmed9_everhadTB + cluster(PID), data=dat_recurrent)
+hist(residuals(model_clust, "deviance"))
+hist(residuals(model_frail, "deviance"))
+#scatterplot, color points by whether they are censored
+plot(residuals(model_clust, "deviance"))
+plot(residuals(model_clust, "deviance"), 
+     col=ifelse(dat_recurrent$Visit == 11 & dat_recurrent$VL <=50, "red", "blue")) 
+
+ggcoxdiagnostics(model_clust, type="deviance")
+ggcoxdiagnostics(model_frail, type="deviance")
+
+
+tst_frail = coxph(Surv3b ~  sqrt(VL_baseline) + Vmed9_everhadTB + frailty(PID), data=dat_recurrent)
+plot(residuals(model_clust, "deviance"), 
+     col=ifelse(dat_recurrent$Visit == 11 & dat_recurrent$VL <=50, "red", "blue")) 
+hist(residuals(tst_frail, "deviance"))
 
 #---------------- write objects to file ------------------
 setwd(paste0(path_out, "/Models"))
